@@ -1,0 +1,95 @@
+# Production Configuration for Message Queue Service
+
+# Application Configuration
+application:
+  cache_trigger_threshold: 200  # Trigger LLM when cache has 200 messages total
+  data_file_path: "data/full_data.csv"
+  company_id: "scaleflow"
+
+# Kafka Configuration
+kafka:
+  bootstrap_servers: 
+    - "localhost:9092"
+  topics:
+    chat: "slack-messages"
+    email: "gmail-messages"
+  consumer_group: "message-processor-group"
+  auto_offset_reset: "earliest"
+  enable_auto_commit: false
+  max_poll_records: 100
+  session_timeout_ms: 30000
+  heartbeat_interval_ms: 10000
+  max_poll_interval_ms: 300000
+  producer:
+    acks: "all"
+    retries: 3
+    max_in_flight_requests_per_connection: 5
+    compression_type: "gzip"
+    batch_size: 16384
+    linger_ms: 10
+    buffer_memory: 33554432
+  consumer:
+    fetch_min_bytes: 1
+    fetch_max_wait_ms: 500
+    max_partition_fetch_bytes: 1048576
+
+# Cassandra Configuration
+cassandra:
+  host: "localhost"
+  port: 9042
+  keyspace: "message_queue_db"
+  replication_factor: 3
+  max_workers: 10
+  consistency_level: "LOCAL_QUORUM"
+  tables:
+    chat_messages: "chat_messages"
+    email_messages: "email_messages"
+    message_metadata: "message_metadata"
+
+# PostgreSQL Configuration (for Events Database)
+postgres:
+  host: "localhost"
+  port: 5432
+  database: "events_db"
+  user: "postgres"
+  password: "postgres"
+
+# Redis Configuration
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  max_connections: 50
+  decode_responses: true
+  socket_timeout: 5
+  socket_connect_timeout: 5
+  retry_on_timeout: true
+  health_check_interval: 30
+  cache:
+    message_limit: 100  # Number of messages to keep in cache before triggering processing
+    ttl: 86400  # 24 hours in seconds
+    poll_interval: 5  # Seconds between polling checks
+
+# Processing Configuration
+processing:
+  batch_size: 50
+  processing_interval: 10  # Seconds
+  max_retries: 3
+  retry_delay: 5  # Seconds
+  dead_letter_queue: true
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/message_service.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+
+# Monitoring Configuration
+monitoring:
+  enable_metrics: true
+  metrics_port: 9090
+  health_check_port: 8080
+
+
