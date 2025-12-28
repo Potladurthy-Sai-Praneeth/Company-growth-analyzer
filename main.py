@@ -1,21 +1,21 @@
-"""Main Pipeline Script for Message Ingestion and Event Processing."""
+"""Main Pipeline Script for Message Ingestion and Event Processing.
+
+Architecture:
+    CSV Data → Kafka Producer → Kafka Topics
+    Kafka Consumers (async) → Cache + Database
+    Cache Threshold → LLM Event Extraction
+    Events → PostgreSQL → Investor Email Generation
+"""
 
 import os
-import sys
 import asyncio
 import pandas as pd
-import logging
-import logging.handlers
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from uuid import uuid4
 from dotenv import load_dotenv
-from pathlib import Path
 
-# Load environment variables
 load_dotenv()
 
-# Import services
 from kafka_service import KafkaQueueService
 from cache_service import MessageCacheService
 from database_service import MessageDatabaseService
@@ -34,31 +34,21 @@ class MessagePipeline:
     """
     Main pipeline for message processing and event extraction.
     
-    Handles:
-    - CSV data reading
-    - Kafka message production
-    - Cache and database storage
-    - LLM-based event extraction
-    - Investor email generation
+    Uses async Kafka consumers to automatically process messages
+    as they arrive in the queue.
     """
     
     def __init__(self, config_path: str = "config.yaml"):
-        """
-        Initialize the message pipeline.
-        
-        Args:
-            config_path: Path to configuration file.
-        """
+        """Initialize the message pipeline."""
         self.config_path = config_path
         self.config = load_config(config_path)
         
-        # Load application configuration
         app_config = self.config.get('application', {})
         self.cache_trigger_threshold = app_config.get('cache_trigger_threshold', 50)
         self.data_file_path = app_config.get('data_file_path', 'data/full_data.csv')
         self.company_id = app_config.get('company_id', 'scaleflow')
         
-        # Initialize processors
+        # Message processors
         self.slack_processor = SlackProcessor()
         self.gmail_processor = GmailProcessor()
         
@@ -71,62 +61,49 @@ class MessagePipeline:
         
         # Processing state
         self.status = ProcessingStatus()
-        self.message_buffer: List[Dict[str, Any]] = []
         self.all_extracted_events: List[SignificantEvent] = []
-        
-        # Async processing
         self.llm_tasks: List[asyncio.Task] = []
         self._running = False
+        self._consumer_ready = asyncio.Event()
+        
+        # Lock to prevent multiple concurrent LLM triggers
+        self._llm_trigger_lock = asyncio.Lock()
     
     async def initialize_services(self):
         """Initialize all required services."""
         try:
-            # Initialize Kafka service
             self.kafka_service = KafkaQueueService(self.config_path)
             await self.kafka_service.initialize()
             
-            # Initialize Cache service
             self.cache_service = MessageCacheService(self.config_path)
             
-            # Initialize Message Database service
             self.db_service = MessageDatabaseService(self.config_path)
             await self.db_service.initialize()
             
-            # Initialize Events Database service
             self.events_db = EventsDatabaseService(self.config_path)
             await self.events_db.initialize()
             
-            # Initialize LLM service
             self.llm_service = LLMService()
             
-            # Register message handlers for Kafka consumers
+            # Register handlers for Kafka consumers
             self.kafka_service.register_message_handler('chat', self._handle_chat_message)
             self.kafka_service.register_message_handler('email', self._handle_email_message)
+            
+            logger.info("All services initialized")
             
         except Exception as e:
             logger.error(f"Failed to initialize services: {e}")
             raise
     
     async def _handle_chat_message(self, message: Dict[str, Any]):
-        """
-        Handle incoming chat message from Kafka.
-        Stores in cache and database asynchronously.
-        """
+        """Handle incoming chat message from Kafka consumer."""
         try:
             company_id = message.get('metadata', {}).get('company_id', self.company_id)
             
-            # Add to cache (non-blocking)
-            should_process, count = self.cache_service.add_message(
-                message, company_id, 'chat'
-            )
-            
-            # Store in database asynchronously
+            self.cache_service.add_message(message, company_id, 'slack')
             asyncio.create_task(self.db_service.store_message(message))
+            self.status.total_messages_ingested += 1
             
-            # Add to message buffer for LLM processing
-            self.message_buffer.append(message)
-            
-            # Check if we should trigger LLM processing
             await self._check_and_trigger_llm(company_id)
             
         except Exception as e:
@@ -134,25 +111,14 @@ class MessagePipeline:
             self.status.errors.append(str(e))
     
     async def _handle_email_message(self, message: Dict[str, Any]):
-        """
-        Handle incoming email message from Kafka.
-        Stores in cache and database asynchronously.
-        """
+        """Handle incoming email message from Kafka consumer."""
         try:
             company_id = message.get('metadata', {}).get('company_id', self.company_id)
             
-            # Add to cache (non-blocking)
-            should_process, count = self.cache_service.add_message(
-                message, company_id, 'email'
-            )
-            
-            # Store in database asynchronously
+            self.cache_service.add_message(message, company_id, 'gmail')
             asyncio.create_task(self.db_service.store_message(message))
+            self.status.total_messages_ingested += 1
             
-            # Add to message buffer for LLM processing
-            self.message_buffer.append(message)
-            
-            # Check if we should trigger LLM processing
             await self._check_and_trigger_llm(company_id)
             
         except Exception as e:
@@ -160,58 +126,49 @@ class MessagePipeline:
             self.status.errors.append(str(e))
     
     async def _check_and_trigger_llm(self, company_id: str):
-        """
-        Check if cache has reached threshold and trigger LLM processing.
-        
-        Args:
-            company_id: Company identifier.
-        """
+        """Check if cache has reached threshold and trigger LLM processing."""
         try:
-            # Get total message count from both sources
-            chat_count = self.cache_service.get_message_count(company_id, 'chat')
-            email_count = self.cache_service.get_message_count(company_id, 'email')
-            total_count = chat_count + email_count
-            
-            self.status.current_cache_size = total_count
-            
-            # Trigger LLM if threshold reached
-            if total_count >= self.cache_trigger_threshold:
-                # Create async task for LLM processing (non-blocking)
-                task = asyncio.create_task(
-                    self._process_messages_with_llm(company_id, chat_count, email_count)
-                )
-                self.llm_tasks.append(task)
-                self.status.llm_triggers += 1
+            # Use lock to prevent race condition where multiple handlers
+            # see cache >= threshold and all trigger LLM simultaneously
+            async with self._llm_trigger_lock:
+                chat_count = self.cache_service.get_message_count(company_id, 'slack')
+                email_count = self.cache_service.get_message_count(company_id, 'gmail')
+                total_count = chat_count + email_count
+                
+                self.status.current_cache_size = total_count
+                
+                if total_count >= self.cache_trigger_threshold:
+                    self.status.llm_triggers += 1
+                    
+                    # Pop messages immediately while holding the lock
+                    # This ensures the next check sees a reduced count
+                    chat_messages = self.cache_service.pop_messages(company_id, 'slack', chat_count)
+                    email_messages = self.cache_service.pop_messages(company_id, 'gmail', email_count)
+                    
+                    # Create task for async LLM processing (outside lock release)
+                    task = asyncio.create_task(
+                        self._process_popped_messages_with_llm(
+                            company_id, chat_messages, email_messages
+                        )
+                    )
+                    self.llm_tasks.append(task)
                 
         except Exception as e:
             logger.error(f"Error checking/triggering LLM: {e}", exc_info=True)
     
-    async def _process_messages_with_llm(
+    async def _process_popped_messages_with_llm(
         self,
         company_id: str,
-        chat_count: int,
-        email_count: int
+        chat_messages: list,
+        email_messages: list
     ):
-        """
-        Process messages with LLM to extract significant events.
-        
-        Args:
-            company_id: Company identifier.
-            chat_count: Number of chat messages in cache.
-            email_count: Number of email messages in cache.
-        """
+        """Process already-popped messages with LLM to extract significant events."""
         try:
-            # Get messages from cache (using 'slack' and 'gmail' as stored)
-            chat_messages = self.cache_service.pop_messages(company_id, 'slack', chat_count)
-            email_messages = self.cache_service.pop_messages(company_id, 'gmail', email_count)
-            
-            # Combine messages
             all_messages = chat_messages + email_messages
             
             if not all_messages:
                 return
             
-            # Create batch for tracking
             batch = MessageBatch(
                 messages=all_messages,
                 company_id=company_id,
@@ -219,15 +176,10 @@ class MessagePipeline:
                 email_count=len(email_messages)
             )
             
-            # Extract events using LLM
-            extraction_result = await self.llm_service.extract_events(
-                all_messages,
-                company_id
-            )
+            extraction_result = await self.llm_service.extract_events(all_messages, company_id)
             
-            # Store events in PostgreSQL
             if extraction_result.events:
-                stored_ids = await self.events_db.store_events_batch(
+                await self.events_db.store_events_batch(
                     extraction_result.events,
                     company_id,
                     batch.batch_id
@@ -236,10 +188,8 @@ class MessagePipeline:
                 self.status.total_events_extracted += len(extraction_result.events)
                 self.all_extracted_events.extend(extraction_result.events)
                 
-                # Milestone log: events extracted
                 print(f"      → Extracted {len(extraction_result.events)} events from {len(all_messages)} messages")
             
-            # Release processing locks
             self.cache_service.release_processing_lock(company_id, 'slack')
             self.cache_service.release_processing_lock(company_id, 'gmail')
             
@@ -247,44 +197,38 @@ class MessagePipeline:
             logger.error(f"Error in LLM processing: {e}", exc_info=True)
             self.status.errors.append(str(e))
     
+    async def start_consumers(self):
+        """Start Kafka consumers to automatically process incoming messages."""
+        await self.kafka_service.start_consuming(['chat', 'email'])
+        self._consumer_ready.set()
+        logger.info("Kafka consumers started")
+    
     async def process_csv_data(self, file_path: str = None):
-        """
-        Read CSV data and pump messages to Kafka queue.
-        
-        Args:
-            file_path: Path to CSV file. If None, uses config value.
-        """
+        """Read CSV data and pump messages to Kafka queue."""
         if file_path is None:
             file_path = self.data_file_path
         
         try:
-            # Read CSV file
+            await self._consumer_ready.wait()
+            
             df = pd.read_csv(file_path)
             total_rows = len(df)
             print(f"      Loaded {total_rows} rows from CSV")
             
-            # Process each row
             for index, row in df.iterrows():
                 try:
-                    # Convert row to dict
                     row_dict = row.to_dict()
-                    
-                    # Determine if chat or email based on is_chat column
                     is_chat = str(row_dict.get('is_chat', 'true')).lower() == 'true'
                     
                     if is_chat:
-                        # Process as Slack message
                         message = self.slack_processor.process(row_dict)
                         topic_type = 'chat'
                     else:
-                        # Process as Gmail message
                         message = self.gmail_processor.process(row_dict)
                         topic_type = 'email'
                     
-                    # Add company_id to metadata
                     message['metadata']['company_id'] = self.company_id
                     
-                    # Send to Kafka
                     success = await self.kafka_service.produce_message(
                         message,
                         topic_type,
@@ -293,81 +237,59 @@ class MessagePipeline:
                     
                     if success:
                         self.status.total_rows_processed += 1
-                        self.status.total_messages_ingested += 1
-                        
-                        # Store directly in cache and database (since we're not running consumers)
-                        await self._store_message_directly(message, topic_type)
                     
-                    # Log progress every 200 rows
                     if (index + 1) % 200 == 0:
                         print(
                             f"      Progress: {index + 1}/{total_rows} rows | "
                             f"{self.status.total_events_extracted} events extracted"
                         )
                     
-                    # Small delay to avoid overwhelming the system
                     await asyncio.sleep(0.01)
                     
                 except Exception as e:
                     logger.error(f"Error processing row {index}: {e}", exc_info=True)
                     self.status.errors.append(f"Row {index}: {str(e)}")
             
-            print(f"      ✓ Finished processing {total_rows} rows")
+            print(f"      ✓ Finished producing {total_rows} rows to Kafka")
             
         except Exception as e:
             logger.error(f"Error reading CSV file: {e}", exc_info=True)
             raise
     
-    async def _store_message_directly(self, message: Dict[str, Any], topic_type: str):
-        """
-        Store message directly in cache and database.
-        This is used when not running Kafka consumers.
+    async def wait_for_consumers(self, timeout: float = 30.0):
+        """Wait for consumers to finish processing all messages."""
+        print("      Waiting for consumers to process remaining messages...")
         
-        Args:
-            message: Message dictionary.
-            topic_type: 'chat' or 'email'.
-        """
-        try:
-            company_id = message.get('metadata', {}).get('company_id', self.company_id)
-            
-            # Add to cache
-            should_process, count = self.cache_service.add_message(
-                message, company_id, 'slack' if topic_type == 'chat' else 'gmail'
-            )
-            
-            # Store in database
-            await self.db_service.store_message(message)
-            
-            # Add to message buffer
-            self.message_buffer.append(message)
-            
-            # Get total count combining both sources
-            chat_count = self.cache_service.get_message_count(company_id, 'slack')
-            email_count = self.cache_service.get_message_count(company_id, 'gmail')
-            total_count = chat_count + email_count
-            
-            self.status.current_cache_size = total_count
-            
-            # Check if we should trigger LLM processing 
-            # This is analogous to a cron job checking the cache periodically
-            if total_count >= self.cache_trigger_threshold:
-                # Process synchronously to ensure completion before continuing
-                await self._process_messages_with_llm(company_id, chat_count, email_count)
-                
-        except Exception as e:
-            logger.error(f"Error storing message directly: {e}", exc_info=True)
+        await asyncio.sleep(2)
+        
+        last_count = -1
+        stable_iterations = 0
+        
+        while stable_iterations < 3 and timeout > 0:
+            current_count = self.status.total_messages_ingested
+            if current_count == last_count:
+                stable_iterations += 1
+            else:
+                stable_iterations = 0
+            last_count = current_count
+            await asyncio.sleep(1)
+            timeout -= 1
+        
+        print(f"      ✓ Consumers processed {self.status.total_messages_ingested} messages")
     
     async def process_remaining_messages(self):
         """Process any remaining messages in the cache that didn't reach threshold."""
         try:
-            # Get remaining messages from cache
             chat_count = self.cache_service.get_message_count(self.company_id, 'slack')
             email_count = self.cache_service.get_message_count(self.company_id, 'gmail')
             total_remaining = chat_count + email_count
             
             if total_remaining > 0:
                 print(f"      Processing {total_remaining} remaining messages...")
-                await self._process_messages_with_llm(self.company_id, chat_count, email_count)
+                self.status.llm_triggers += 1
+                chat_messages = self.cache_service.pop_messages(self.company_id, 'slack', chat_count)
+                email_messages = self.cache_service.pop_messages(self.company_id, 'gmail', email_count)
+                await self._process_popped_messages_with_llm(self.company_id, chat_messages, email_messages)
             else:
                 print("      No remaining messages to process")
                 
@@ -381,14 +303,8 @@ class MessagePipeline:
             self.llm_tasks.clear()
     
     async def generate_investor_email(self):
-        """
-        Generate investor email from all extracted events.
-        
-        Returns:
-            Tuple of (formatted output string, email object).
-        """
+        """Generate investor email from all extracted events."""
         try:
-            # Get all active events from database
             events = await self.events_db.get_active_events_for_email(self.company_id)
             
             if not events:
@@ -396,7 +312,6 @@ class MessagePipeline:
             
             print(f"      Generating email from {len(events)} events...")
             
-            # Generate email using LLM
             email = await self.llm_service.generate_investor_email(
                 events=events,
                 startup_name="ScaleFlow",
@@ -404,7 +319,6 @@ class MessagePipeline:
                 sender_title="CEO"
             )
             
-            # Format the output
             output = f"""
 {'='*80}
 GENERATED INVESTOR EMAIL
@@ -446,9 +360,8 @@ Total events analyzed: {len(events)}
             logger.error(f"Error generating investor email: {e}", exc_info=True)
             raise
     
-    def _write_output_file(self, stats: Dict, email_output: str, email_obj) -> str:
+    def _write_output_file(self, stats: Dict, email_obj) -> str:
         """Write results to markdown output file."""
-        # Ensure output directory exists
         os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
         
         duration = (self.status.completed_at - self.status.started_at).total_seconds() if self.status.completed_at else 0
@@ -463,7 +376,7 @@ Total events analyzed: {len(events)}
 | Metric | Value |
 |--------|-------|
 | Total Rows Processed | {self.status.total_rows_processed} |
-| Total Messages Ingested | {self.status.total_messages_ingested} |
+| Total Messages Consumed | {self.status.total_messages_ingested} |
 | Total Events Extracted | {self.status.total_events_extracted} |
 | LLM Triggers | {self.status.llm_triggers} |
 | Processing Duration | {duration:.2f} seconds |
@@ -518,7 +431,7 @@ Total events analyzed: {len(events)}
         return OUTPUT_FILE
     
     async def run(self):
-        """Run the complete pipeline."""
+        """Run the complete pipeline with async consumer pattern."""
         self._running = True
         self.status.started_at = datetime.now()
         self.status.status = "running"
@@ -528,26 +441,27 @@ Total events analyzed: {len(events)}
         print("=" * 60)
         
         try:
-            # Step 1: Initialize all services
-            print("\n[1/5] Initializing services...")
+            print("\n[1/6] Initializing services...")
             await self.initialize_services()
             print("      ✓ All services initialized")
             
-            # Step 2: Process CSV data
-            print("\n[2/5] Processing CSV data...")
+            print("\n[2/6] Starting Kafka consumers...")
+            asyncio.create_task(self.start_consumers())
+            await asyncio.sleep(1)
+            print("      ✓ Consumers started and listening")
+            
+            print("\n[3/6] Processing CSV data...")
             await self.process_csv_data()
             
-            # Step 3: Process any remaining messages
-            print("\n[3/5] Processing remaining messages...")
-            await self.process_remaining_messages()
+            print("\n[4/6] Waiting for consumers to complete...")
+            await self.wait_for_consumers()
             
-            # Step 4: Wait for all LLM tasks to complete
+            print("\n[5/6] Processing remaining messages...")
+            await self.process_remaining_messages()
             await self.wait_for_llm_tasks()
             
-            # Step 5: Generate statistics and email
-            print("\n[4/5] Generating investor email...")
+            print("\n[6/6] Generating investor email...")
             
-            # Get event statistics from database
             try:
                 stats = await self.events_db.get_event_statistics(self.company_id)
             except Exception:
@@ -555,15 +469,11 @@ Total events analyzed: {len(events)}
             
             email_output, email_obj = await self.generate_investor_email()
             
-            # Mark completion
             self.status.completed_at = datetime.now()
             self.status.status = "completed"
             
-            # Write output file
-            print("\n[5/5] Writing output file...")
-            output_path = self._write_output_file(stats, email_output, email_obj)
+            output_path = self._write_output_file(stats, email_obj)
             
-            # Print summary to console
             duration = (self.status.completed_at - self.status.started_at).total_seconds()
             print("\n" + "=" * 60)
             print("     PIPELINE COMPLETED SUCCESSFULLY")
@@ -571,6 +481,7 @@ Total events analyzed: {len(events)}
             print(f"""
 📊 Summary:
    • Rows Processed: {self.status.total_rows_processed}
+   • Messages Consumed: {self.status.total_messages_ingested}
    • Events Extracted: {self.status.total_events_extracted}
    • LLM Triggers: {self.status.llm_triggers}
    • Duration: {duration:.2f} seconds
@@ -586,28 +497,15 @@ Total events analyzed: {len(events)}
         finally:
             await self.cleanup()
     
-    async def _get_statistics(self):
-        """Get pipeline statistics from database."""
-        try:
-            stats = await self.events_db.get_event_statistics(self.company_id)
-        except Exception as stats_error:
-            logger.warning(f"Could not fetch event statistics: {stats_error}")
-            stats = {}
-        
-        return stats
-    
     async def cleanup(self):
         """Cleanup resources."""
         try:
             if self.kafka_service:
                 await self.kafka_service.close()
-            
             if self.cache_service:
                 self.cache_service.close()
-            
             if self.db_service:
                 await self.db_service.close()
-            
             if self.events_db:
                 await self.events_db.close()
         except Exception as e:
@@ -621,5 +519,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Run the async main function
     asyncio.run(main())

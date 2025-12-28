@@ -1,3 +1,6 @@
 .env
 logs/
 __pycache__/
+explanation.md
+*.pdf
+pipeline_results.md

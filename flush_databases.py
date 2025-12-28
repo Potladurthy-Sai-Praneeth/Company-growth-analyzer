@@ -5,6 +5,42 @@ import asyncio
 import redis
 import asyncpg
 from cassandra.cluster import Cluster
+from kafka.admin import KafkaAdminClient, NewTopic
+from kafka import KafkaConsumer
+
+
+def flush_kafka():
+    """Delete and recreate Kafka topics to clear all messages."""
+    try:
+        admin_client = KafkaAdminClient(
+            bootstrap_servers=['localhost:9092'],
+            client_id='flush-script'
+        )
+        
+        topics_to_flush = ['slack-messages', 'gmail-messages', 'slack-messages-dlq', 'gmail-messages-dlq']
+        existing_topics = admin_client.list_topics()
+        
+        # Delete existing topics
+        topics_to_delete = [t for t in topics_to_flush if t in existing_topics]
+        if topics_to_delete:
+            admin_client.delete_topics(topics_to_delete)
+            print(f"✓ Kafka: Deleted topics {topics_to_delete}")
+            
+            # Wait for deletion to complete
+            import time
+            time.sleep(2)
+        
+        # Recreate topics
+        new_topics = [
+            NewTopic(name=topic, num_partitions=3, replication_factor=1)
+            for topic in topics_to_flush
+        ]
+        admin_client.create_topics(new_topics=new_topics, validate_only=False)
+        print(f"✓ Kafka: Recreated topics {topics_to_flush}")
+        
+        admin_client.close()
+    except Exception as e:
+        print(f"✗ Kafka: Failed to flush - {e}")
 
 
 def flush_redis():
@@ -49,6 +85,7 @@ def main():
     print("FLUSHING ALL DATABASES")
     print("=" * 50)
     
+    flush_kafka()
     flush_redis()
     flush_cassandra()
     asyncio.run(flush_postgres())
