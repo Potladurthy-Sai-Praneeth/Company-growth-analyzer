@@ -1,6 +1,7 @@
 # Message Processing & Event Extraction Workflow
 
 A production-ready event-driven pipeline that processes company's communications (Slack messages and emails), extracts significant business events using LLM, and generates investor outreach emails.
+
 --- 
 
 ### Key Features
@@ -167,6 +168,7 @@ python main.py
 ```
 
 This ensures no partial data from previous runs interferes with the current execution.
+
 ---
 
 ## File Documentation
