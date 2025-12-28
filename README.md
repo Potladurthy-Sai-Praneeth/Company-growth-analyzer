@@ -6,31 +6,16 @@ A production-ready event-driven pipeline that processes company's communications
 ### Key Features
 
 - **Real-time Message Processing**: Kafka-based queue system for handling high-throughput message streams
-- **Intelligent Event Extraction**: Google Gemini LLM identifies significant business milestones from communications
+- **Intelligent Event Extraction**: Google Gemini LLM identifies significant business milestones from communication channels
 - **Efficient Caching**: Redis cache with threshold-based batch processing
 - **Scalable Storage**: Cassandra for messages, PostgreSQL for events
 - **Automated Email Generation**: AI-generated investor outreach emails based on extracted events
 
----
-
-## System Architecture
-
-```
-CSV Data → Kafka Topics → Cache (Redis) → Database (Cassandra)
-                             ↓
-                     Threshold Reached (200 messages)
-                             ↓
-                        LLM Processing (Gemini)
-                             ↓
-                    Events Database (PostgreSQL)
-                             ↓
-                   Investor Email Generation
-```
 
 ### Components
 
-1. **Kafka**: Message queue for decoupling data ingestion from processing
-2. **Redis**: Temporary cache for batching messages before LLM processing
+1. **Kafka**: Message queue with async consumers for real-time processing
+2. **Redis**: Temporary cache with threshold-based batch triggering
 3. **Cassandra**: Persistent storage for raw messages (chat and email)
 4. **PostgreSQL**: Structured storage for extracted significant events
 5. **Google Gemini LLM**: Event extraction and email generation
@@ -152,21 +137,36 @@ This creates `data/full_data.csv` with 1000 simulated messages.
 python main.py
 ```
 
-This will:
-1. Initialize all services (Kafka, Redis, Cassandra, PostgreSQL)
-2. Process messages from `data/full_data.csv`
-3. Extract events using LLM when cache reaches 200 messages
-4. Generate an investor email from all extracted events
-5. Output results to `output/pipeline_results.md`
+**What happens:**
+1. Initializes all services (Kafka, Redis, Cassandra, PostgreSQL, LLM)
+2. Starts async Kafka consumers that listen to chat and email topics
+3. Reads and produces messages from `data/full_data.csv` to Kafka
+4. Consumers automatically process each message as it arrives:
+   - Store in cache (Redis) and database (Cassandra) simultaneously
+   - Check if cache threshold (200 messages) is reached
+   - If threshold met, trigger async LLM processing
+5. Waits for all consumers to finish processing messages
+6. Processes any remaining cached messages below threshold
+7. Waits for all async LLM tasks to complete
+8. Generates investor email from all extracted events
+9. Outputs results to `output/pipeline_results.md`
 
-### Method 2: Flush Databases Before Running (Delete partial runs from previous attempts if any)
+**Key Features:**
+- **Async Processing**: Consumers process messages in real-time as they arrive
+- **Parallel Execution**: Multiple LLM tasks can run concurrently
+- **Automatic Batching**: Cache automatically triggers LLM when threshold is met
+- **Non-blocking**: CSV reading doesn't wait for message processing
 
-To start with clean databases:
+### Method 2: Flush Databases Before Running
+
+To start with clean databases (recommended for fresh runs):
 
 ```bash
 python flush_databases.py
 python main.py
 ```
+
+This ensures no partial data from previous runs interferes with the current execution.
 ---
 
 ## File Documentation
@@ -177,65 +177,86 @@ Main orchestration script that runs the entire pipeline.
 **Key Components:**
 - `MessagePipeline`: Main pipeline class that coordinates all services
 - `initialize_services()`: Sets up Kafka, Redis, Cassandra, PostgreSQL, and LLM services
-- `process_csv_data()`: Reads CSV file and sends messages to Kafka
-- `_store_message_directly()`: Stores messages in cache and database
-- `_process_messages_with_llm()`: Triggers LLM event extraction when cache reaches threshold
+- `start_consumers()`: Starts async Kafka consumers for automatic message processing
+- `_handle_chat_message()`: Consumer callback for processing chat messages from Kafka
+- `_handle_email_message()`: Consumer callback for processing email messages from Kafka
+- `_check_and_trigger_llm()`: Checks cache threshold and triggers LLM processing
+- `_process_popped_messages_with_llm()`: Async LLM event extraction task
+- `process_csv_data()`: Reads CSV file and produces messages to Kafka
+- `wait_for_consumers()`: Waits for consumers to finish processing messages
+- `process_remaining_messages()`: Processes cached messages below threshold
+- `wait_for_llm_tasks()`: Waits for all async LLM tasks to complete
 - `generate_investor_email()`: Creates investor outreach email from extracted events
 - `run()`: Executes the complete pipeline workflow
 
-**Flow:**
-1. Load configuration from `config.yaml`
-2. Initialize all services
-3. Read CSV data row by row
-4. Process each row as Slack or Gmail message
-5. Store in cache and database
-6. When cache reaches 200 messages, extract events using LLM
-7. After all data processed, generate investor email
-8. Write results to markdown file
+**Consumer Architecture:**
+The pipeline uses **async Kafka consumers** that automatically process messages as they arrive:
+1. Consumers register handler functions for chat and email topics
+2. When a message arrives, the appropriate handler is called asynchronously
+3. Handlers store messages in both cache (Redis) and database (Cassandra) simultaneously
+4. After each message, checks if cache threshold (200) is reached
+5. If threshold met, spawns async task to process messages with LLM
+6. Uses lock mechanism to prevent duplicate LLM triggers from concurrent handlers
 
 ---
 
 ### Service Files
 
 #### **kafka_service.py**
-Kafka Queue Service for message production and consumption.
+Kafka Queue Service for message production and asynchronous consumption.
 
 **Features:**
 - Creates and manages Kafka topics (slack-messages, gmail-messages)
-- Producer: Sends messages to topics with retry logic
-- Consumer: Asynchronously processes messages from topics
+- Producer: Sends messages to topics with retry logic and validation
+- Async Consumer: Automatically processes messages from topics in real-time
+- Handler registration system for message callbacks
 - Dead letter queue for failed messages
 - Health monitoring and metrics tracking
 
 **Key Methods:**
 - `initialize()`: Sets up Kafka admin client, creates topics, and initializes producer
 - `produce_message()`: Sends a message to specified topic with validation
-- `start_consuming()`: Starts async consumers for processing messages
+- `start_consuming()`: Starts async consumers for processing messages from topics
 - `register_message_handler()`: Registers callback functions for message processing
+- `_consume_topic()`: Internal async loop that consumes messages and calls handlers
+- `close()`: Gracefully shuts down producer and consumers
+
+**Consumer Pattern:**
+- Consumers run in async background tasks
+- Each topic (chat/email) has dedicated consumer
+- Messages automatically trigger registered handler functions
+- Non-blocking architecture allows parallel message processing
 
 ---
 
 #### **cache_service.py**
-Redis Cache Service for temporary message storage and batch triggering.
+Redis Cache Service for temporary message storage and threshold-based triggering.
 
 **Features:**
 - Caches messages by company_id and source (slack/gmail)
 - Automatic TTL expiration (24 hours default)
 - Threshold-based processing triggers
 - Thread-safe operations with connection pooling
-- Processing locks to prevent duplicate processing
+- Processing locks to prevent duplicate processing during async operations
 
 **Key Methods:**
-- `add_message()`: Adds message to cache, returns if threshold reached
+- `add_message()`: Adds message to cache
+- `get_message_count()`: Returns count of cached messages for a source
 - `get_messages()`: Retrieves messages from cache
-- `pop_messages()`: Removes and returns messages from cache
-- `poll_for_processing()`: Checks all queues for threshold triggers
+- `pop_messages()`: Atomically removes and returns messages from cache
+- `release_processing_lock()`: Releases lock after LLM processing
 - `get_cache_stats()`: Returns cache statistics
+- `close()`: Closes Redis connection
 
 **Cache Keys:**
-- `messages:{company_id}:{source}:queue` - Message storage
+- `messages:{company_id}:{source}:queue` - Message storage (list)
 - `messages:{company_id}:{source}:metadata` - Cache metadata
 - `messages:{company_id}:{source}:processing` - Processing lock flag
+
+**Async Pattern:**
+- Supports concurrent access from multiple consumer handlers
+- Messages are popped atomically to prevent duplicate processing
+- Lock mechanism ensures only one LLM task processes a batch
 
 ---
 
@@ -425,15 +446,18 @@ Generates synthetic startup communication data for testing.
 
 **Application Settings:**
 - `cache_trigger_threshold`: Number of messages to trigger LLM processing (default: 200)
-- `data_file_path`: Path to input CSV file
-- `company_id`: Company identifier for message tracking
+- `data_file_path`: Path to input CSV file (default: `data/full_data.csv`)
+- `company_id`: Company identifier for message tracking (default: `scaleflow`)
 
 **Redis Cache:**
-- `message_limit`: Messages per source before trigger (default: 100)
+- `message_limit`: Max messages per source before trigger (default: 100)
 - `ttl`: Cache expiration time in seconds (default: 86400 = 24 hours)
-- `poll_interval`: Polling frequency in seconds
+- Connection pooling for concurrent access from multiple consumers
 
-**Kafka Topics:**
-- `slack-messages`: Chat message topic
-- `gmail-messages`: Email message topic
-- Auto-created dead letter queues (DLQ) for failed messages
+**Kafka Configuration:**
+- **Topics**: 
+  - `slack-messages`: Chat message topic
+  - `gmail-messages`: Email message topic
+- **Consumer Groups**: Async consumers with automatic offset management
+- **Auto-commit**: Enabled for automatic offset tracking
+

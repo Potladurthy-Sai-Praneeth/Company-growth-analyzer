@@ -1,10 +1,22 @@
+# Core Data Processing
 pandas==2.3.3
 python-dotenv==1.2.1
+
+# Message Queue
 kafka-python==2.3.0
+
+# Databases
 cassandra-driver==3.29.3
 redis==5.0.1
 asyncpg==0.30.0
+
+# Configuration & Validation
 PyYAML==6.0.1
 pydantic==2.12.5
+
+# LLM & LangChain
 langchain-google-genai==3.0.1
 langchain-core==1.0.3
+langchain==1.0.4
+google-ai-generativelanguage==0.9.0
+google-genai==1.50.0
