@@ -1,4 +1,4 @@
-# Sago Workflow - Message Processing & Event Extraction Pipeline
+# Message Processing & Event Extraction Workflow
 
 A production-ready event-driven pipeline that processes company's communications (Slack messages and emails), extracts significant business events using LLM, and generates investor outreach emails.
 --- 
