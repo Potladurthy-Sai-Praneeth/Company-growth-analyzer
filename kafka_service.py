@@ -191,7 +191,7 @@ class KafkaQueueService:
                 message['produced_at'] = datetime.now().isoformat()
             
             # Prepare key
-            message_key = None
+            message_key = message['metadata']['company_id']
             if key:
                 message_key = key.encode('utf-8')
             

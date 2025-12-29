@@ -241,7 +241,7 @@ class MessagePipeline:
                     if (index + 1) % 200 == 0:
                         print(
                             f"      Progress: {index + 1}/{total_rows} rows | "
-                            f"{self.status.total_events_extracted} events extracted"
+                            # f"{self.status.total_events_extracted} events extracted"
                         )
                     
                     await asyncio.sleep(0.01)

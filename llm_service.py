@@ -26,7 +26,8 @@ load_dotenv()
 logger = setup_logging(__name__, "llm_service")
 
 
-EVENT_EXTRACTION_SYSTEM_PROMPT = """You are an expert information processing agent specializing in analyzing startup communications to identify significant business events. Your role is to help investors track startup growth and milestones by carefully analyzing messages and emails.
+EVENT_EXTRACTION_SYSTEM_PROMPT = """You are an expert information processing agent specializing in analyzing startup communications to identify significant business events.
+Your role is to help investors track startup growth and milestones by carefully analyzing messages and emails.
 
 ## Your Expertise:
 - Deep understanding of startup metrics (MRR, ARR, NRR, churn, DAU, etc.)

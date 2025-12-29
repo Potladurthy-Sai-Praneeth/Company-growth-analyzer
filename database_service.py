@@ -121,9 +121,7 @@ class MessageDatabaseService:
             # Get table names
             chat_messages_table = self.cassandra_config['tables'].get('chat_messages', 'chat_messages')
             email_messages_table = self.cassandra_config['tables'].get('email_messages', 'email_messages')
-            metadata_table = self.cassandra_config['tables'].get(
-                'message_metadata', 'message_metadata'
-            )
+            metadata_table = self.cassandra_config['tables'].get('message_metadata', 'message_metadata')            
             
             # Create chat messages table
             # This table stores chat messages from Slack
